@@ -1,0 +1,8 @@
+name: Paperclip Agents
+author: wortmanb
+description: Your Paperclip AI agent company at a glance - a robot per agent (green and bouncing when working), inbox count, today's spend and a task-status bar.
+tags:
+  - monitor
+  - ai
+  - info
+preview: ./preview.gif
