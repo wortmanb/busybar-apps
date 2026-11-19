@@ -5,10 +5,9 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# Default to minimal permissions; each job declares only what it needs.
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 concurrency:
   group: pages
@@ -29,16 +28,77 @@ jobs:
           cache: npm
 
       - run: npm ci
-      - run: npm run build
+
+      - name: Build (wortmanb fork — lab deployment)
+        if: github.repository == 'wortmanb/busybar-apps'
+        env:
+          SITE_URL: ${{ vars.SITE_URL || 'https://busybar-apps.lab.thewortmans.org' }}
+          BASE_PATH: ${{ vars.BASE_PATH || '/' }}
+        run: npm run build
+
+      - name: Build (upstream — GitHub Pages)
+        if: github.repository != 'wortmanb/busybar-apps'
+        run: npm run build
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
           path: ./dist
 
-  deploy:
+  # ── Pull-based lab deployment (wortmanb/busybar-apps only) ───────────────
+  #
+  # Pushes dist/ as an orphan commit to the public `deploy-lab` branch.
+  # infra.lab runs a systemd timer every ~3 min that fetches this branch
+  # and atomically publishes it under /srv/busybar-apps.
+  # No self-hosted runner, no inbound network access to the LAN host.
+  #
+  deploy-lab:
+    if: github.repository == 'wortmanb/busybar-apps'
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write   # needed to push deploy-lab branch
+    environment:
+      name: lab
+      url: https://busybar-apps.lab.thewortmans.org
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: github-pages
+          path: /tmp/pages-artifact
+
+      - name: Extract artifact
+        run: |
+          mkdir /tmp/dist
+          tar -xf /tmp/pages-artifact/artifact.tar -C /tmp/dist
+
+      - name: Push dist/ as orphan commit to deploy-lab branch
+        env:
+          DEPLOY_SHA: ${{ github.sha }}
+        run: |
+          cd /tmp/dist
+          git init -b deploy-lab
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add .
+          git commit -m "deploy: ${DEPLOY_SHA}"
+          git remote add origin \
+            "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          git push --force origin deploy-lab
+
+  # ── Upstream GitHub Pages deployment (maxswinkels/busybar-apps only) ─────
+  #
+  # Retained so the upstream repo can keep using this workflow file as-is.
+  # Skipped entirely on the wortmanb fork.
+  #
+  deploy-pages:
+    if: github.repository == 'maxswinkels/busybar-apps'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
