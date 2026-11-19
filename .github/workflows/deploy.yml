@@ -5,10 +5,9 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# Default to minimal permissions; each job declares only what it needs.
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 concurrency:
   group: pages
@@ -33,8 +32,8 @@ jobs:
       - name: Build (wortmanb fork — lab deployment)
         if: github.repository == 'wortmanb/busybar-apps'
         env:
-          SITE_URL: ${{ vars.SITE_URL }}
-          BASE_PATH: ${{ vars.BASE_PATH }}
+          SITE_URL: ${{ vars.SITE_URL || 'https://busybar-apps.lab.thewortmans.org' }}
+          BASE_PATH: ${{ vars.BASE_PATH || '/' }}
         run: npm run build
 
       - name: Build (upstream — GitHub Pages)
@@ -46,16 +45,19 @@ jobs:
         with:
           path: ./dist
 
-  # ── Self-hosted lab deployment (wortmanb/busybar-apps only) ──────────────
+  # ── Pull-based lab deployment (wortmanb/busybar-apps only) ───────────────
   #
-  # Runs on the self-hosted runner labelled "infra" on infra.lab.thewortmans.org.
-  # Publishes /srv/busybar-apps atomically via a staging-dir + symlink swap so
-  # the site is never in a half-deployed state.
+  # Pushes dist/ as an orphan commit to the public `deploy-lab` branch.
+  # infra.lab runs a systemd timer every ~3 min that fetches this branch
+  # and atomically publishes it under /srv/busybar-apps.
+  # No self-hosted runner, no inbound network access to the LAN host.
   #
   deploy-lab:
     if: github.repository == 'wortmanb/busybar-apps'
     needs: build
-    runs-on: [self-hosted, infra]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # needed to push deploy-lab branch
     environment:
       name: lab
       url: https://busybar-apps.lab.thewortmans.org
@@ -64,34 +66,26 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: github-pages
-          path: /tmp/busybar-pages-artifact
+          path: /tmp/pages-artifact
 
       - name: Extract artifact
         run: |
-          mkdir -p /tmp/busybar-deploy
-          tar -xf /tmp/busybar-pages-artifact/artifact.tar \
-              -C /tmp/busybar-deploy
-          rm -rf /tmp/busybar-pages-artifact
+          mkdir /tmp/dist
+          tar -xf /tmp/pages-artifact/artifact.tar -C /tmp/dist
 
-      - name: Publish atomically
+      - name: Push dist/ as orphan commit to deploy-lab branch
+        env:
+          DEPLOY_SHA: ${{ github.sha }}
         run: |
-          DEST=/srv/busybar-apps
-          STAGING="${DEST}.staging.$$"
-          CURRENT="${DEST}.current"
-
-          # Move the new build into a staging directory
-          mv /tmp/busybar-deploy "$STAGING"
-
-          # Atomically swap the symlink
-          ln -sfn "$STAGING" "${DEST}.next"
-          mv -Tf "${DEST}.next" "$DEST"
-
-          # Remove the previous release (the old real dir)
-          if [ -d "$CURRENT" ]; then
-            rm -rf "$CURRENT"
-          fi
-          # Keep a pointer to current release for rollback reference
-          ln -sfn "$STAGING" "$CURRENT"
+          cd /tmp/dist
+          git init -b deploy-lab
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add .
+          git commit -m "deploy: ${DEPLOY_SHA}"
+          git remote add origin \
+            "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          git push --force origin deploy-lab
 
   # ── Upstream GitHub Pages deployment (maxswinkels/busybar-apps only) ─────
   #
@@ -102,6 +96,9 @@ jobs:
     if: github.repository == 'maxswinkels/busybar-apps'
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
