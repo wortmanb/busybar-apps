@@ -47,15 +47,20 @@ sudo chown gh-runner:gh-runner /srv/busybar-apps
 
 ### 2. Install the Actions runner
 
-```bash
-sudo -u gh-runner bash
-cd /opt/gh-runner
-mkdir actions-runner && cd actions-runner
+Note: `/opt/gh-runner` is mode 750 (owned by `gh-runner`), so use
+`sudo -u gh-runner` or `sudo bash -c` rather than a plain `cd`.
 
-# Download — check https://github.com/actions/runner/releases for latest
-curl -o actions-runner-linux-x64.tar.gz -L \
-  https://github.com/actions/runner/releases/download/v2.325.0/actions-runner-linux-x64-2.325.0.tar.gz
-tar xzf actions-runner-linux-x64.tar.gz
+```bash
+# Check https://github.com/actions/runner/releases for the latest version
+RUNNER_VERSION=2.338.2
+sudo -u gh-runner bash -c "
+  mkdir -p /opt/gh-runner/actions-runner
+  cd /opt/gh-runner/actions-runner
+  curl -fsSL -o runner.tar.gz \
+    https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz
+  tar xzf runner.tar.gz
+  rm runner.tar.gz
+"
 ```
 
 ### 3. Register (you need a short-lived token)
@@ -64,7 +69,7 @@ Go to **https://github.com/wortmanb/busybar-apps/settings/actions/runners/new**
 and copy the token shown (`AXXXXXXXXXX...`).
 
 ```bash
-./config.sh \
+sudo -u gh-runner /opt/gh-runner/actions-runner/config.sh \
   --url https://github.com/wortmanb/busybar-apps \
   --token <PASTE_TOKEN_HERE> \
   --name infra-lab \
@@ -75,12 +80,13 @@ and copy the token shown (`AXXXXXXXXXX...`).
 
 ### 4. Install as a systemd service
 
-Exit the `gh-runner` shell, then as root:
+The `/opt/gh-runner` directory is mode 750 (owned by `gh-runner`), so a plain
+`cd` will fail for other users. Use `sudo bash -c` to run the svc commands
+from within the directory:
 
 ```bash
-cd /opt/gh-runner/actions-runner
-sudo ./svc.sh install gh-runner
-sudo ./svc.sh start
+sudo bash -c "cd /opt/gh-runner/actions-runner && ./svc.sh install gh-runner"
+sudo bash -c "cd /opt/gh-runner/actions-runner && ./svc.sh start"
 sudo systemctl status actions.runner.wortmanb-busybar-apps.infra-lab.service
 ```
 
