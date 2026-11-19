@@ -1,0 +1,19 @@
+[Unit]
+Description=busybar-apps pull-based deploy
+Documentation=https://github.com/wortmanb/busybar-apps/blob/main/docs/DEPLOY-SELF-HOSTED.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=gh-runner
+Group=gh-runner
+ExecStart=/opt/busybar-deploy/deploy.sh
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=busybar-deploy
+# Harden the service
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/busybar-deploy /srv
+PrivateTmp=true

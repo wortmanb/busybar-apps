@@ -14,11 +14,11 @@ GitHub Actions (ubuntu-latest)
 
 infra.lab (systemd timer, every 3 min)
   busybar-deploy.service ──► git fetch deploy-lab (public HTTPS, no credentials)
-                          ──► if SHA changed: git archive → /srv/busybar-apps-releases/<SHA>/
-                          ──► atomic symlink swap: /srv/busybar-apps → new release
+                          ──► if SHA changed: git archive → /srv/busybar-apps/releases/<SHA>/
+                          ──► atomic symlink swap: /srv/busybar-apps/current → new release
 
 infra.lab (Caddy)
-  busybar-apps.lab.thewortmans.org ──► file_server /srv/busybar-apps (via /srv bind mount)
+  busybar-apps.lab.thewortmans.org ──► file_server /srv/busybar-apps/current (via /srv bind mount)
 ```
 
 **Security model:** The infra host only makes outbound HTTPS pulls to a public
@@ -99,10 +99,10 @@ journalctl -u busybar-deploy -f
 systemctl list-timers busybar-deploy.timer
 
 # See the currently deployed SHA
-cat /srv/busybar-apps/.deploy-sha
+cat /srv/busybar-apps/current/.deploy-sha
 
 # List release history
-ls /srv/busybar-apps-releases/
+ls /srv/busybar-apps/releases/
 ```
 
 ---
@@ -111,14 +111,15 @@ ls /srv/busybar-apps-releases/
 
 `busybar-apps.lab.thewortmans.org` is served by Caddy using:
 
-- **Bind mount:** `/srv:/srv:ro` added to the Caddy container so symlink
-  swaps to `/srv/busybar-apps-releases/<SHA>` are visible inside the container.
+- **Bind mount:** `/srv:/srv:ro` added to the Caddy container (replaces the
+  earlier `/srv/busybar-apps:/srv/busybar-apps:ro`) so the symlink
+  `/srv/busybar-apps/current → releases/<SHA>/` resolves inside the container.
 - **Caddyfile block:**
 
   ```caddyfile
   busybar-apps.lab.thewortmans.org {
       import wortmancert
-      root * /srv/busybar-apps
+      root * /srv/busybar-apps/current
       file_server
       encode gzip
   }
@@ -147,14 +148,14 @@ To roll back to the previous release:
 
 ```bash
 # List available releases (newest first)
-ls -1dt /srv/busybar-apps-releases/*/
+ls -1dt /srv/busybar-apps/releases/*/
 
 # Point the symlink at the previous release
-sudo -u gh-runner ln -sfn /srv/busybar-apps-releases/<PREVIOUS_SHA> /srv/busybar-apps.next
-sudo -u gh-runner mv -Tf /srv/busybar-apps.next /srv/busybar-apps
+sudo -u gh-runner ln -sfn /srv/busybar-apps/releases/<PREVIOUS_SHA> /srv/busybar-apps/current.next
+sudo -u gh-runner mv -Tf /srv/busybar-apps/current.next /srv/busybar-apps/current
 
 # Verify
-cat /srv/busybar-apps/.deploy-sha
+cat /srv/busybar-apps/current/.deploy-sha
 ```
 
 ---
@@ -168,8 +169,8 @@ If reinstalling from scratch on a new host:
 sudo useradd -r -m -d /opt/gh-runner -s /sbin/nologin gh-runner
 
 # 2. Create directories
-sudo mkdir -p /opt/busybar-deploy /srv/busybar-apps-releases
-sudo chown gh-runner:gh-runner /opt/busybar-deploy /srv/busybar-apps-releases
+sudo mkdir -p /opt/busybar-deploy /srv/busybar-apps/releases
+sudo chown -R gh-runner:gh-runner /opt/busybar-deploy /srv/busybar-apps
 
 # 3. Place the deploy script
 sudo cp busybar-deploy.sh /opt/busybar-deploy/deploy.sh
