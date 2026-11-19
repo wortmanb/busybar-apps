@@ -29,14 +29,77 @@ jobs:
           cache: npm
 
       - run: npm ci
-      - run: npm run build
+
+      - name: Build (wortmanb fork — lab deployment)
+        if: github.repository == 'wortmanb/busybar-apps'
+        env:
+          SITE_URL: ${{ vars.SITE_URL }}
+          BASE_PATH: ${{ vars.BASE_PATH }}
+        run: npm run build
+
+      - name: Build (upstream — GitHub Pages)
+        if: github.repository != 'wortmanb/busybar-apps'
+        run: npm run build
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
           path: ./dist
 
-  deploy:
+  # ── Self-hosted lab deployment (wortmanb/busybar-apps only) ──────────────
+  #
+  # Runs on the self-hosted runner labelled "infra" on infra.lab.thewortmans.org.
+  # Publishes /srv/busybar-apps atomically via a staging-dir + symlink swap so
+  # the site is never in a half-deployed state.
+  #
+  deploy-lab:
+    if: github.repository == 'wortmanb/busybar-apps'
+    needs: build
+    runs-on: [self-hosted, infra]
+    environment:
+      name: lab
+      url: https://busybar-apps.lab.thewortmans.org
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: github-pages
+          path: /tmp/busybar-pages-artifact
+
+      - name: Extract artifact
+        run: |
+          mkdir -p /tmp/busybar-deploy
+          tar -xf /tmp/busybar-pages-artifact/artifact.tar \
+              -C /tmp/busybar-deploy
+          rm -rf /tmp/busybar-pages-artifact
+
+      - name: Publish atomically
+        run: |
+          DEST=/srv/busybar-apps
+          STAGING="${DEST}.staging.$$"
+          CURRENT="${DEST}.current"
+
+          # Move the new build into a staging directory
+          mv /tmp/busybar-deploy "$STAGING"
+
+          # Atomically swap the symlink
+          ln -sfn "$STAGING" "${DEST}.next"
+          mv -Tf "${DEST}.next" "$DEST"
+
+          # Remove the previous release (the old real dir)
+          if [ -d "$CURRENT" ]; then
+            rm -rf "$CURRENT"
+          fi
+          # Keep a pointer to current release for rollback reference
+          ln -sfn "$STAGING" "$CURRENT"
+
+  # ── Upstream GitHub Pages deployment (maxswinkels/busybar-apps only) ─────
+  #
+  # Retained so the upstream repo can keep using this workflow file as-is.
+  # Skipped entirely on the wortmanb fork.
+  #
+  deploy-pages:
+    if: github.repository == 'maxswinkels/busybar-apps'
     needs: build
     runs-on: ubuntu-latest
     environment:
