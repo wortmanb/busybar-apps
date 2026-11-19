@@ -15,3 +15,4 @@ __pycache__/
 .busyrec-tmp.json
 apps/*/.venv/
 .playwright-mcp
+/apps/paperclip-agents/start
