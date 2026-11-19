@@ -1,4 +1,4 @@
-# Self-Hosted Deployment — infra.lab.thewortmans.org
+# Lab Deployment — infra.lab.thewortmans.org (Pull-Based)
 
 This document explains how the `wortmanb/busybar-apps` fork is deployed to
 `busybar-apps.lab.thewortmans.org` on `infra.lab.thewortmans.org` (192.168.10.197).
@@ -8,120 +8,131 @@ This document explains how the `wortmanb/busybar-apps` fork is deployed to
 ## Architecture overview
 
 ```
-GitHub Actions
-  build job  ──► ubuntu-latest runner  ──► builds ./dist, uploads artifact
-  deploy-lab ──► self-hosted [infra]   ──► extracts artifact, swaps /srv/busybar-apps symlink
+GitHub Actions (ubuntu-latest)
+  build job      ──► npm run build (with SITE_URL/BASE_PATH vars)
+  deploy-lab job ──► force-push dist/ as orphan commit → wortmanb/busybar-apps@deploy-lab
+
+infra.lab (systemd timer, every 3 min)
+  busybar-deploy.service ──► git fetch deploy-lab (public HTTPS, no credentials)
+                          ──► if SHA changed: git archive → /srv/busybar-apps-releases/<SHA>/
+                          ──► atomic symlink swap: /srv/busybar-apps → new release
 
 infra.lab (Caddy)
-  busybar-apps.lab.thewortmans.org  ──► file_server /srv/busybar-apps
+  busybar-apps.lab.thewortmans.org ──► file_server /srv/busybar-apps (via /srv bind mount)
 ```
 
-The build job runs on GitHub-hosted `ubuntu-latest`. Only the final publish
-step touches the LAN host, which is not reachable from the internet.
+**Security model:** The infra host only makes outbound HTTPS pulls to a public
+GitHub repo. No inbound connections, no self-hosted runner, no credentials
+stored anywhere. Code execution on infra from GitHub is impossible — only static
+files are fetched and published.
 
 ---
 
 ## Repo variables (fork Settings → Variables → Actions)
 
-| Variable    | Value for wortmanb fork                          | Purpose                     |
+| Variable    | Default if unset                                 | Purpose                     |
 |-------------|--------------------------------------------------|-----------------------------|
 | `SITE_URL`  | `https://busybar-apps.lab.thewortmans.org`       | Astro `site` config         |
 | `BASE_PATH` | `/`                                              | Astro `base` config         |
 
-These are injected at build time only for the `wortmanb/busybar-apps` repository.
+If neither variable is set, the fork's workflow uses hardcoded fallback
+defaults, so no user action is required. Setting them overrides the defaults.
+
 The upstream repo (`maxswinkels/busybar-apps`) builds without these vars and
-retains its original GitHub Pages configuration (`site: https://maxswinkels.github.io`,
-`base: /busybar-apps/`).
+retains its original GitHub Pages configuration.
 
 ---
 
-## Self-hosted runner setup (one-time)
+## How the deploy works (workflow side)
 
-### 1. Create a dedicated low-privilege user
+A push to `main` (or manual `workflow_dispatch`) triggers the `Deploy` workflow:
 
-```bash
-sudo useradd -r -m -d /opt/gh-runner -s /sbin/nologin gh-runner
-sudo mkdir -p /srv/busybar-apps
-sudo chown gh-runner:gh-runner /srv/busybar-apps
-```
+1. **`build`** job on `ubuntu-latest`: runs `npm ci && npm run build` with
+   `SITE_URL`/`BASE_PATH` injected from repo variables (or defaults). Uploads
+   `./dist` as a `github-pages` artifact.
 
-### 2. Install the Actions runner
+2. **`deploy-lab`** job (`github.repository == 'wortmanb/busybar-apps'`):
+   downloads the artifact, extracts it, and force-pushes the contents as a
+   single orphan commit to the `deploy-lab` branch. Requires `contents: write`
+   permission; uses `GITHUB_TOKEN` (short-lived, scoped to the run).
 
-Note: `/opt/gh-runner` is mode 750 (owned by `gh-runner`), so use
-`sudo -u gh-runner` or `sudo bash -c` rather than a plain `cd`.
+3. **`deploy-pages`** job (`github.repository == 'maxswinkels/busybar-apps'`):
+   upstream GitHub Pages deployment (unchanged from upstream).
 
-```bash
-# Check https://github.com/actions/runner/releases for the latest version
-RUNNER_VERSION=2.338.2
-sudo -u gh-runner bash -c "
-  mkdir -p /opt/gh-runner/actions-runner
-  cd /opt/gh-runner/actions-runner
-  curl -fsSL -o runner.tar.gz \
-    https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz
-  tar xzf runner.tar.gz
-  rm runner.tar.gz
-"
-```
+The `deploy-lab` branch is public and contains **only** the built static site
+files; no source code is included.
 
-### 3. Register (you need a short-lived token)
+---
 
-Go to **https://github.com/wortmanb/busybar-apps/settings/actions/runners/new**
-and copy the token shown (`AXXXXXXXXXX...`).
+## How the deploy works (infra side)
 
-```bash
-sudo -u gh-runner /opt/gh-runner/actions-runner/config.sh \
-  --url https://github.com/wortmanb/busybar-apps \
-  --token <PASTE_TOKEN_HERE> \
-  --name infra-lab \
-  --labels infra \
-  --runnergroup Default \
-  --unattended
-```
+### systemd units
 
-### 4. Install as a systemd service
+Two units are installed on `infra.lab.thewortmans.org`:
 
-The `/opt/gh-runner` directory is mode 750 (owned by `gh-runner`), so a plain
-`cd` will fail for other users. Use `sudo bash -c` to run the svc commands
-from within the directory:
+**`busybar-deploy.service`** — a oneshot service that:
+1. Initialises a bare git repo at `/opt/busybar-deploy/repo.git` (on first run).
+2. Fetches the `deploy-lab` branch with `--depth=1` over public HTTPS.
+3. Compares the fetched SHA with the currently deployed SHA.
+4. If changed: archives the commit into `/srv/busybar-apps-releases/<SHA>/`,
+   atomically swaps `/srv/busybar-apps` to the new release (single `mv -Tf`
+   syscall), prunes old releases (keeps last 2).
+5. Logs everything to the systemd journal (`journalctl -u busybar-deploy`).
+
+**`busybar-deploy.timer`** — fires `OnUnitActiveSec=3min` (3-minute poll)
+with up to 30 s random jitter. Enabled at boot.
+
+### Manual trigger
 
 ```bash
-sudo bash -c "cd /opt/gh-runner/actions-runner && ./svc.sh install gh-runner"
-sudo bash -c "cd /opt/gh-runner/actions-runner && ./svc.sh start"
-sudo systemctl status actions.runner.wortmanb-busybar-apps.infra-lab.service
+# Deploy immediately (wait for result)
+sudo systemctl start busybar-deploy.service
+
+# Watch the logs
+journalctl -u busybar-deploy -f
 ```
 
-### 5. Verify
+### Check deploy status
 
-The runner should appear as **Online** at
-`https://github.com/wortmanb/busybar-apps/settings/actions/runners`.
+```bash
+# See last run time and next scheduled run
+systemctl list-timers busybar-deploy.timer
+
+# See the currently deployed SHA
+cat /srv/busybar-apps/.deploy-sha
+
+# List release history
+ls /srv/busybar-apps-releases/
+```
 
 ---
 
 ## Caddy configuration
 
-`busybar-apps.lab.thewortmans.org` is served directly by Caddy from
-`/srv/busybar-apps` using a read-only bind mount added to the caddy container
-(`/srv/busybar-apps:/srv/busybar-apps:ro`) and a `file_server` block:
+`busybar-apps.lab.thewortmans.org` is served by Caddy using:
 
-```caddyfile
-busybar-apps.lab.thewortmans.org {
-    import wortmancert
-    root * /srv/busybar-apps
-    file_server
-    encode gzip
-}
-```
+- **Bind mount:** `/srv:/srv:ro` added to the Caddy container so symlink
+  swaps to `/srv/busybar-apps-releases/<SHA>` are visible inside the container.
+- **Caddyfile block:**
 
-The TLS certificate is the existing wildcard cert at `/etc/wortman-certs/`.
+  ```caddyfile
+  busybar-apps.lab.thewortmans.org {
+      import wortmancert
+      root * /srv/busybar-apps
+      file_server
+      encode gzip
+  }
+  ```
 
-After any change to `/data/caddy/compose.yml` (adding the bind mount), reload:
+  TLS uses the existing wildcard cert at `/etc/wortman-certs/`.
+
+After any change to `/data/caddy/compose.yml`:
 
 ```bash
 cd /data/caddy && docker compose up -d --force-recreate caddy
 ```
 
-After Caddyfile-only changes (no compose changes needed after the initial mount),
-the caddy container auto-reloads its config. You can also trigger a manual reload:
+After Caddyfile-only changes:
 
 ```bash
 docker exec caddy caddy reload --config /etc/caddy/Caddyfile
@@ -129,33 +140,64 @@ docker exec caddy caddy reload --config /etc/caddy/Caddyfile
 
 ---
 
-## Deployment flow
+## Rollback
 
-1. A push to `main` (or manual `workflow_dispatch`) triggers the `Deploy` workflow.
-2. The `build` job on `ubuntu-latest` runs `npm ci && npm run build` with
-   `SITE_URL` and `BASE_PATH` injected from repo variables.
-3. The built `./dist` directory is uploaded as a `github-pages` artifact.
-4. The `deploy-lab` job on the self-hosted `[infra]` runner:
-   - Downloads and extracts the artifact to a temp directory.
-   - Moves the extracted files to a timestamped staging dir under `/srv/`.
-   - Atomically swaps the `/srv/busybar-apps` symlink to point at the new dir.
-   - Removes the previous release directory.
+Each deploy keeps up to 2 previous releases in `/srv/busybar-apps-releases/`.
+To roll back to the previous release:
 
-This ensures the site is never in a partially-deployed state.
+```bash
+# List available releases (newest first)
+ls -1dt /srv/busybar-apps-releases/*/
+
+# Point the symlink at the previous release
+sudo -u gh-runner ln -sfn /srv/busybar-apps-releases/<PREVIOUS_SHA> /srv/busybar-apps.next
+sudo -u gh-runner mv -Tf /srv/busybar-apps.next /srv/busybar-apps
+
+# Verify
+cat /srv/busybar-apps/.deploy-sha
+```
+
+---
+
+## First-time infra setup (future hosts)
+
+If reinstalling from scratch on a new host:
+
+```bash
+# 1. Create unprivileged user
+sudo useradd -r -m -d /opt/gh-runner -s /sbin/nologin gh-runner
+
+# 2. Create directories
+sudo mkdir -p /opt/busybar-deploy /srv/busybar-apps-releases
+sudo chown gh-runner:gh-runner /opt/busybar-deploy /srv/busybar-apps-releases
+
+# 3. Place the deploy script
+sudo cp busybar-deploy.sh /opt/busybar-deploy/deploy.sh
+sudo chown gh-runner:gh-runner /opt/busybar-deploy/deploy.sh
+sudo chmod 750 /opt/busybar-deploy/deploy.sh
+
+# 4. Install systemd units
+sudo cp busybar-deploy.{service,timer} /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now busybar-deploy.timer
+
+# 5. Add Caddy site block and /srv:/srv:ro bind mount (see above)
+```
 
 ---
 
 ## Security notes
 
-- **Only** the `deploy-lab` job targets `self-hosted` runners. The `ci.yml`,
-  `pr-comment.yml`, and `apps-index.yml` workflows continue to run on
-  GitHub-hosted runners.
-- The `deploy-lab` job is gated by `if: github.repository == 'wortmanb/busybar-apps'`
-  so fork PRs from outside collaborators cannot trigger it.
-- **Recommended**: in the fork's Settings → Actions → General, set
+- The `deploy-lab` branch is public — anyone can read it, but only
+  `GITHUB_TOKEN` from a workflow run on `wortmanb/busybar-apps` can push to it.
+- The infra timer runs as `gh-runner` (no login shell, home at `/opt/gh-runner`).
+  It can only write to `/opt/busybar-deploy` and `/srv`.
+- `ProtectSystem=strict` in the service unit prevents writes outside
+  `ReadWritePaths`.
+- **Recommended:** in the fork's Settings → Actions → General, set
   "Fork pull request workflows from outside collaborators" to
-  **"Require approval for all outside collaborators"**. This prevents
-  untrusted PRs from even queueing a workflow run.
+  **"Require approval for all outside collaborators"** to prevent untrusted
+  PRs from triggering a build.
 
 ---
 
@@ -164,12 +206,12 @@ This ensures the site is never in a partially-deployed state.
 When you are ready to expose the site beyond the LAN:
 
 1. Install `cloudflared` on `infra.lab.thewortmans.org`.
-2. Create a tunnel:  
+2. Create a tunnel:
    ```bash
    cloudflared tunnel create busybar-apps
    ```
 3. Add an ingress rule pointing `busybar-apps.thewortmans.org` →
-   `https://busybar-apps.lab.thewortmans.org` (or directly to the Caddy port).
-4. Update `SITE_URL` repo variable to the new public hostname and re-run the
-   workflow so Astro rebuilds asset paths correctly.
+   `https://busybar-apps.lab.thewortmans.org`.
+4. Update the `SITE_URL` repo variable to the new public hostname and re-run
+   the workflow so Astro rebuilds asset paths correctly.
 5. Optionally add a Cloudflare Access policy to restrict to your team.
