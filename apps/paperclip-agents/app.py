@@ -38,6 +38,24 @@ A Paperclip server in local_trusted mode on the same machine needs no token.
 Otherwise pass a board API key with --token or PAPERCLIP_API_KEY
 (``paperclipai auth login`` creates one). The app is strictly read-only.
 
+Run as a macOS service (per-user LaunchAgent: starts at login, restarts on
+crash, not respawned after a clean stop):
+
+    python3 app.py --install-service --host 10.0.4.20 --company <id>
+    python3 app.py --service-status
+    python3 app.py --uninstall-service
+
+--install-service takes the same flags you would run the app with (minus
+--once) and writes ~/Library/LaunchAgents/com.busybar.paperclip-agents.plist,
+then loads it with launchctl. Re-running it replaces the service. Secrets
+(--token / PAPERCLIP_API_KEY, --bar-token / BUSY_HTTP_PASSWORD) go into the
+plist's EnvironmentVariables, never argv, and the plist is then chmod 0600.
+The service runs with --wait-for-bar: if the bar is unreachable (asleep,
+unplugged, Wi-Fi not up yet at login) it retries with backoff instead of
+exiting. Logs: ~/Library/Logs/paperclip-agents.log. Inspect it with
+
+    launchctl print gui/$(id -u)/com.busybar.paperclip-agents
+
 Standard library only.
 """
 
@@ -45,6 +63,9 @@ import argparse
 import json
 import math
 import os
+import plistlib
+import signal
+import subprocess
 import sys
 import time
 import urllib.error
@@ -62,6 +83,10 @@ FRAME_INTERVAL = 0.25    # s; ~4 fps robot animation
 PAGE_SECONDS = 4.0       # s; each metric page holds this long
 STALE_SECONDS = 120      # s; data older than this gets a red "stale" pixel
 ELEMENT_TIMEOUT = 30     # s; dead-man window - a killed app clears itself
+RETRY_MAX = 60           # s; --wait-for-bar backoff ceiling
+
+SERVICE_LABEL = "com.busybar.paperclip-agents"
+SERVICE_LOG = os.path.join("Library", "Logs", "paperclip-agents.log")
 
 # ---- palette ---------------------------------------------------------------
 WHITE = "#FFFFFFFF"
@@ -514,14 +539,178 @@ def parse_args(argv=None):
     p.add_argument("--demo", action="store_true", help="scripted data, no Paperclip needed")
     p.add_argument("--once", "--test", action="store_true", dest="once",
                    help="draw one frame and exit")
+    p.add_argument("--wait-for-bar", action="store_true",
+                   help="if the bar is unreachable, retry with backoff instead of "
+                        "exiting (the macOS service always uses this)")
+    svc = p.add_mutually_exclusive_group()
+    svc.add_argument("--install-service", action="store_true",
+                     help="macOS: install and start a LaunchAgent running this app "
+                          "with the other flags given")
+    svc.add_argument("--uninstall-service", action="store_true",
+                     help="macOS: stop and remove the LaunchAgent")
+    svc.add_argument("--service-status", action="store_true",
+                     help="macOS: show the LaunchAgent's launchctl status")
     args = p.parse_args(argv)
     if not 1 <= args.priority <= 100:
         p.error("--priority must be between 1 and 100")
     return args
 
 
+# ---- macOS launchd service -----------------------------------------------------------
+
+def service_plist_path(home=None):
+    return os.path.join(home or os.path.expanduser("~"), "Library", "LaunchAgents",
+                        SERVICE_LABEL + ".plist")
+
+
+def build_service_plist(args, app_path=None, python=None, home=None):
+    """The LaunchAgent as a dict (pure: no filesystem or launchctl access).
+
+    Uses the *resolved* option values, so settings that came from environment
+    variables in this shell (PAPERCLIP_API_URL, PAPERCLIP_COMPANY_ID, ...) are
+    pinned into the service, which won't see this shell's environment.
+    """
+    home = home or os.path.expanduser("~")
+    prog = [python or sys.executable, os.path.abspath(app_path or __file__),
+            "--host", args.host,
+            "--poll", f"{args.poll:g}",
+            "--cost-poll", f"{args.cost_poll:g}",
+            "--priority", str(args.priority),
+            "--wait-for-bar"]
+    if args.demo:
+        prog.append("--demo")
+    else:
+        prog += ["--paperclip", args.paperclip]
+        if args.company:
+            prog += ["--company", args.company]
+    # --once is never persisted: a one-shot exits 0, which KeepAlive won't respawn.
+
+    env = {"PYTHONUNBUFFERED": "1"}   # log lines land in the log file promptly
+    if args.token and not args.demo:
+        env["PAPERCLIP_API_KEY"] = args.token
+    if args.bar_token:
+        env["BUSY_HTTP_PASSWORD"] = args.bar_token
+
+    log = os.path.join(home, SERVICE_LOG)
+    return {
+        "Label": SERVICE_LABEL,
+        "ProgramArguments": prog,
+        "EnvironmentVariables": env,
+        "WorkingDirectory": os.path.dirname(prog[1]),
+        "RunAtLoad": True,
+        # Respawn after a crash or error exit, but not after a clean stop.
+        "KeepAlive": {"SuccessfulExit": False},
+        "ThrottleInterval": 10,
+        # Interactive: a 4 fps display loop; Background would get its timers
+        # coalesced and CPU throttled, making the robots stutter.
+        "ProcessType": "Interactive",
+        "StandardOutPath": log,
+        "StandardErrorPath": log,
+    }
+
+
+def plist_has_secrets(plist):
+    env = plist.get("EnvironmentVariables", {})
+    return any(k in env for k in ("PAPERCLIP_API_KEY", "BUSY_HTTP_PASSWORD"))
+
+
+def _launchctl(*cmd):
+    return subprocess.run(["launchctl", *cmd], capture_output=True, text=True)
+
+
+def _require_macos():
+    if sys.platform != "darwin":
+        sys.exit("error: --install-service/--uninstall-service/--service-status use "
+                 f"launchd and only work on macOS (this is {sys.platform}); "
+                 "on Linux run the app under systemd or your init of choice")
+
+
+def install_service(args):
+    _require_macos()
+    if args.once:
+        print("note: --once is not persisted into the service", file=sys.stderr)
+    plist = build_service_plist(args)
+    path = service_plist_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    os.makedirs(os.path.dirname(plist["StandardOutPath"]), exist_ok=True)
+
+    uid = os.getuid()
+    domain, target = f"gui/{uid}", f"gui/{uid}/{SERVICE_LABEL}"
+    _launchctl("bootout", target)          # idempotent reinstall; fails if not loaded
+
+    # Write with 0600 from the start when it holds secrets, so no window
+    # where the token is world-readable.
+    mode = 0o600 if plist_has_secrets(plist) else 0o644
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with os.fdopen(fd, "wb") as fh:
+        plistlib.dump(plist, fh)
+    os.chmod(path, mode)                   # O_CREAT mode is ignored for an existing file
+
+    _launchctl("enable", target)           # clear a disable left by `unload -w`
+    for attempt in range(5):
+        res = _launchctl("bootstrap", domain, path)
+        if res.returncode == 0:
+            break
+        # bootout is asynchronous; bootstrap can race it ("Input/output error").
+        time.sleep(0.5 * (attempt + 1))
+    else:
+        legacy = _launchctl("load", "-w", path)   # pre-10.10 macOS
+        if legacy.returncode != 0:
+            sys.exit(f"error: launchctl could not load {path}:\n"
+                     f"{(res.stderr or res.stdout).strip()}\n{legacy.stderr.strip()}")
+    print(f"installed {SERVICE_LABEL}\n  plist: {path}"
+          f"{' (0600, contains secrets)' if mode == 0o600 else ''}\n"
+          f"  log:   {plist['StandardOutPath']}\n"
+          f"  run:   {' '.join(plist['ProgramArguments'])}\n"
+          f"  check: launchctl print {target}")
+    return 0
+
+
+def uninstall_service():
+    _require_macos()
+    path = service_plist_path()
+    res = _launchctl("bootout", f"gui/{os.getuid()}/{SERVICE_LABEL}")
+    if res.returncode != 0 and os.path.exists(path):
+        _launchctl("unload", "-w", path)   # pre-10.10 macOS
+    if os.path.exists(path):
+        os.remove(path)
+        print(f"uninstalled {SERVICE_LABEL} (removed {path})")
+    else:
+        print(f"{SERVICE_LABEL} was not installed")
+    return 0
+
+
+def service_status():
+    _require_macos()
+    path = service_plist_path()
+    print(f"plist: {path} ({'present' if os.path.exists(path) else 'missing'})")
+    res = _launchctl("print", f"gui/{os.getuid()}/{SERVICE_LABEL}")
+    if res.returncode != 0:
+        print("not loaded")
+        return 1
+    for line in res.stdout.splitlines():
+        s = line.strip()
+        if s.startswith(("state =", "pid =", "last exit code", "runs =")):
+            print(s)
+    return 0
+
+
+def _sigterm(signum, frame):
+    # launchd (on stop/bootout), systemd and a bare `kill` all send SIGTERM.
+    # Raising here puts them on the Ctrl-C path: one exit that clears the display.
+    raise KeyboardInterrupt
+
+
 def main(argv=None):
     args = parse_args(argv)
+    if args.install_service:
+        return install_service(args)
+    if args.uninstall_service:
+        return uninstall_service()
+    if args.service_status:
+        return service_status()
+
+    signal.signal(signal.SIGTERM, _sigterm)
     bar = BusyBar(args.host, args.bar_token, args.priority)
     pc = Paperclip(args.paperclip, args.token, args.company)
 
@@ -529,6 +718,7 @@ def main(argv=None):
     last_poll = last_cost = 0.0
     last_error = None
     blocked = False
+    bar_down = 0             # consecutive unreachable draws (--wait-for-bar)
     start = time.time()
     tick = 0
 
@@ -555,7 +745,22 @@ def main(argv=None):
                     last_error = str(exc)
 
             stale = snap is not None and now - snap["fetched_at"] > STALE_SECONDS
-            status, body = bar.draw(build_frame(snap, now, tick, stale))
+            try:
+                status, body = bar.draw(build_frame(snap, now, tick, stale))
+            except DeviceError as exc:
+                if args.once or not args.wait_for_bar:
+                    raise
+                # Back off 2, 4, 8 ... RETRY_MAX s; log only the first failure.
+                bar_down += 1
+                delay = min(RETRY_MAX, 2 ** bar_down)
+                if bar_down == 1:
+                    print(f"bar unreachable ({exc}); retrying with backoff...",
+                          file=sys.stderr, flush=True)
+                time.sleep(delay)
+                continue
+            if bar_down:
+                print("bar reachable again", flush=True)
+                bar_down = 0
             if status == 200:
                 blocked = False
             elif status == 409:
