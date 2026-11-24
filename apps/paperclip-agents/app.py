@@ -24,6 +24,11 @@ is non-empty, and the envelope glows amber.
 
 Back (160x80, if your bar has one): a text dashboard with every number.
 
+The display is acquired only when a fresh poll reports a running agent, and
+released after 600 seconds without confirmed activity. Startup idle does not
+take the display. Polling continues while released; new activity reacquires it.
+Failed/stale polls do not keep cached running agents active indefinitely.
+
 Data comes from the Paperclip control-plane REST API:
 
     GET /api/companies/:id/agents          agent statuses
@@ -84,6 +89,7 @@ PAGE_SECONDS = 4.0       # s; each metric page holds this long
 STALE_SECONDS = 120      # s; data older than this gets a red "stale" pixel
 ELEMENT_TIMEOUT = 30     # s; dead-man window - a killed app clears itself
 RETRY_MAX = 60           # s; --wait-for-bar backoff ceiling
+IDLE_GRACE_SECONDS = 600 # s; release display after activity stops
 
 SERVICE_LABEL = "com.busybar.paperclip-agents"
 SERVICE_LOG = os.path.join("Library", "Logs", "paperclip-agents.log")
@@ -515,6 +521,35 @@ class BusyBar:
         return self._send(req)
 
 
+class ActivityGate:
+    """Monotonic activity/grace state; cached or failed polls cannot renew it."""
+
+    def __init__(self):
+        self.running_until = None
+        self.idle_since = None
+        self.was_running = False
+
+    def observe(self, snap, now, age=0):
+        # Called only for a new poll (None on failure), never for a cached frame.
+        running = snap is not None and age <= STALE_SECONDS and any(
+            a["status"] == "running" for a in snap["agents"])
+        if not running and self.was_running and self.idle_since is None:
+            self.idle_since = min(now, self.running_until)
+        self.running_until = now + STALE_SECONDS - age if running else None
+        if running:
+            self.idle_since = None
+        self.was_running = running
+
+    def visible(self, now):
+        if self.running_until is not None:
+            if now <= self.running_until:
+                return True
+            if self.idle_since is None:
+                self.idle_since = self.running_until
+        return (self.idle_since is not None
+                and now - self.idle_since < IDLE_GRACE_SECONDS)
+
+
 # ---- main --------------------------------------------------------------------------
 
 def parse_args(argv=None):
@@ -538,7 +573,7 @@ def parse_args(argv=None):
                    help="draw priority 1-100 (default 20, yields to notifications)")
     p.add_argument("--demo", action="store_true", help="scripted data, no Paperclip needed")
     p.add_argument("--once", "--test", action="store_true", dest="once",
-                   help="draw one frame and exit")
+                   help="poll once, draw one frame only if active, and exit")
     p.add_argument("--wait-for-bar", action="store_true",
                    help="if the bar is unreachable, retry with backoff instead of "
                         "exiting (the macOS service always uses this)")
@@ -715,25 +750,35 @@ def main(argv=None):
     pc = Paperclip(args.paperclip, args.token, args.company)
 
     snap = None
-    last_poll = last_cost = 0.0
+    last_poll = last_cost = None
     last_error = None
     blocked = False
     bar_down = 0             # consecutive unreachable draws (--wait-for-bar)
-    start = time.time()
+    start = time.monotonic()
+    gate = ActivityGate()
+    display_owned = False
+    snapshot_at = None
+    snapshot_age = 0
     tick = 0
 
     print(f"{APP} -> {bar.base}  (Paperclip: {'demo' if args.demo else args.paperclip})"
           "  Ctrl-C to stop", flush=True)
     try:
         while True:
-            now = time.time()
+            now = time.monotonic()
             if args.demo:
                 snap = demo_snapshot(now - start)
-            elif last_poll == 0.0 or now - last_poll >= args.poll:
+                snapshot_at, snapshot_age = now, 0
+                gate.observe(snap, now)
+            elif last_poll is None or now - last_poll >= args.poll:
                 last_poll = now
-                want_cost = last_cost == 0.0 or now - last_cost >= args.cost_poll
+                want_cost = last_cost is None or now - last_cost >= args.cost_poll
                 try:
                     snap = pc.snapshot(want_cost=want_cost, previous=snap)
+                    now = time.monotonic()
+                    snapshot_at = now
+                    snapshot_age = max(0, time.time() - snap["fetched_at"])
+                    gate.observe(snap, now, snapshot_age)
                     if want_cost:
                         last_cost = now
                     if last_error:
@@ -743,10 +788,24 @@ def main(argv=None):
                     if str(exc) != last_error:
                         print(f"paperclip unavailable: {exc}", file=sys.stderr, flush=True)
                     last_error = str(exc)
+                    now = time.monotonic()
+                    gate.observe(None, now)
 
-            stale = snap is not None and now - snap["fetched_at"] > STALE_SECONDS
+            stale = (snapshot_at is not None
+                     and snapshot_age + now - snapshot_at > STALE_SECONDS)
+            visible = gate.visible(now)
+            if not visible and not display_owned:
+                if args.once:
+                    return 0
+                time.sleep(FRAME_INTERVAL)
+                continue
             try:
-                status, body = bar.draw(build_frame(snap, now, tick, stale))
+                if visible:
+                    # Even a timed-out POST may have reached the device.
+                    display_owned = True
+                    status, body = bar.draw(build_frame(snap, now, tick, stale))
+                else:
+                    status, body = bar.clear()
             except DeviceError as exc:
                 if args.once or not args.wait_for_bar:
                     raise
@@ -763,6 +822,8 @@ def main(argv=None):
                 bar_down = 0
             if status == 200:
                 blocked = False
+                if not visible:
+                    display_owned = False
             elif status == 409:
                 if args.once:
                     sys.exit("error: display busy, another app has priority")
@@ -779,10 +840,11 @@ def main(argv=None):
             tick += 1
             time.sleep(FRAME_INTERVAL)
     except KeyboardInterrupt:
-        try:
-            bar.clear()
-        except DeviceError:
-            pass
+        if display_owned:
+            try:
+                bar.clear()
+            except DeviceError:
+                pass
         print("\nstopped.")
         return 0
     except DeviceError as exc:
