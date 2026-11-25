@@ -5,7 +5,6 @@ import urllib.error
 from unittest.mock import MagicMock, patch
 
 import app
-import cloud
 
 CONFIG = {"unit": "F", "channels": {
     "food": {"device_uuid": "device-a", "channel": 1, "label": "FOOD", "upper": 165},
@@ -22,14 +21,14 @@ def fixture():
 class CloudTests(unittest.TestCase):
     def test_normalization(self):
         data = fixture()
-        result = cloud.normalize(data, CONFIG)
+        result = app.normalize(data, CONFIG)
         probes = app.parse(result, CONFIG, 1767225600)
         self.assertAlmostEqual(probes[0].temp, 158)
         self.assertEqual(probes[1].temp, 250)
         self.assertFalse(probes[0].stale)
         for bad in [None, "", {}, "2026-01-01T00:00:00"]:
             data[0]['latest_temps'][0]['created'] = bad
-            self.assertTrue(app.parse(cloud.normalize(data, CONFIG), CONFIG, 1767225600)[0].stale)
+            self.assertTrue(app.parse(app.normalize(data, CONFIG), CONFIG, 1767225600)[0].stale)
 
     def test_malformed_omitted_duplicate_unknown(self):
         for samples in [None, [], [None], [{"channel": 1, "temp": 50, "degreetype": 0}],
@@ -37,26 +36,26 @@ class CloudTests(unittest.TestCase):
                         fixture()[0]['latest_temps'] * 2]:
             data = fixture()
             data[0]['latest_temps'] = samples
-            result = cloud.normalize(data, CONFIG)['channels']
+            result = app.normalize(data, CONFIG)['channels']
             self.assertIsNone(result[0]['temperature'])
             self.assertEqual(result[1]['temperature'], 250)
         data = fixture()
         data[0]['latest_temps'][0]['temp'] = 0
-        self.assertEqual(cloud.normalize(data, CONFIG)['channels'][0]['temperature'], 0)
+        self.assertEqual(app.normalize(data, CONFIG)['channels'][0]['temperature'], 0)
 
     @patch.dict(os.environ, {"FIREBOARD_TOKEN": "fixture-secret"})
-    @patch('cloud.urllib.request.build_opener')
+    @patch('app.urllib.request.build_opener')
     def test_cache_auth_and_request(self, build):
         response = MagicMock()
         response.__enter__.return_value.read.return_value = json.dumps(fixture()).encode()
         build.return_value.open.return_value = response
         clock = MagicMock(return_value=0)
-        source = cloud.CloudSource(CONFIG, clock)
+        source = app.CloudSource(CONFIG, clock)
         source.read()
         source.read()
         self.assertEqual(build.return_value.open.call_count, 1)
         req = build.return_value.open.call_args.args[0]
-        self.assertEqual(req.full_url, cloud.ENDPOINT)
+        self.assertEqual(req.full_url, app.ENDPOINT)
         self.assertEqual(req.get_header('Authorization'), 'Token fixture-secret')
         self.assertTrue(req.get_header('User-agent'))
         clock.return_value = 30
@@ -68,11 +67,11 @@ class CloudTests(unittest.TestCase):
         self.assertEqual(build.return_value.open.call_count, 2)
 
     @patch.dict(os.environ, {"FIREBOARD_TOKEN": "fixture-secret"})
-    @patch('cloud.urllib.request.build_opener')
+    @patch('app.urllib.request.build_opener')
     def test_throttle_backoff_redirect(self, build):
         for headers, expected in [({}, 300), ({'Retry-After': '600'}, 600),
                                   ({'Retry-After': '10'}, 300)]:
-            source = cloud.CloudSource(CONFIG, lambda: 0)
+            source = app.CloudSource(CONFIG, lambda: 0)
             build.return_value.open.side_effect = urllib.error.HTTPError('url', 429, '', headers, None)
             source.read()
             self.assertEqual(source.next_poll, expected)
@@ -80,12 +79,32 @@ class CloudTests(unittest.TestCase):
             source.read()
             self.assertEqual(build.return_value.open.call_count, count)
         for error in [urllib.error.URLError('offline'), urllib.error.HTTPError('url', 503, '', {}, None)]:
-            source = cloud.CloudSource(CONFIG, lambda: 0)
+            source = app.CloudSource(CONFIG, lambda: 0)
             build.return_value.open.side_effect = error
             source.read()
             self.assertEqual(source.next_poll, 60)
         with self.assertRaises(ValueError):
-            cloud.NoRedirect().redirect_request(None, None, 302, '', {}, 'https://other')
+            app.NoRedirect().redirect_request(None, None, 302, '', {}, 'https://other')
+
+    @patch.dict(os.environ, {"FIREBOARD_TOKEN": "fixture-secret"})
+    @patch('app.urllib.request.build_opener')
+    def test_cached_samples_age_and_http_date_retry(self, build):
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = json.dumps(fixture()).encode()
+        build.return_value.open.return_value = response
+        source = app.CloudSource(CONFIG, lambda: 0)
+        original = source.read()
+        cached = source.read()
+        self.assertEqual(original, cached)
+        self.assertTrue(app.parse(cached, CONFIG, 1767225800)[0].stale)
+        cached['channels'].clear()
+        self.assertEqual(len(source.read()['channels']), 2)
+        source = app.CloudSource(CONFIG, lambda: 0)
+        build.return_value.open.side_effect = urllib.error.HTTPError(
+            'url', 429, '', {'Retry-After': 'Thu, 01 Jan 2026 00:10:00 GMT'}, None)
+        with patch('app.time.time', return_value=1767225600):
+            source.read()
+        self.assertEqual(source.next_poll, 600)
 
     def test_proximity(self):
         p = app.Probe('PIT', 'pit', 250, False, [], 32, [('LO', 225), ('HI', 275)])

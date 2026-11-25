@@ -3,6 +3,9 @@
 Stdlib-only Python 3.10+ host app for BusyBar's 72×16 display. Implemented:
 direct read-only FireBoard Cloud ingestion, normalized JSON bridge/file, and demo.
 No account, hardware or deployment is needed for tests or preview.
+`app.py` is self-contained: copying/downloading that file alone supports `--help`
+and the built-in demo without sibling modules, config files or pip dependencies.
+Live modes additionally require your own configuration (and cloud token for cloud).
 
 ```sh
 /usr/bin/python3 apps/fireboard/app.py --demo --host 127.0.0.1:8080
@@ -50,7 +53,7 @@ budget. Run only one poller; this cache is per process, not a distributed lock.
 429 waits at least five minutes, or longer Retry-After seconds/HTTP-date; transport,
 malformed payload and other HTTP failures back off up to 15 minutes. 401/403 stop
 requests until restart. Failed polls blank cached readings immediately and show
-SOURCE ERROR/CHECK INPUT; no raw errors or account metadata are logged.
+OFFLINE, AUTH or RATE LIMIT with CHECK INPUT; no raw errors or account metadata are logged.
 
 Only `latest_temps[].channel/temp/degreetype/created` supplies measurements.
 Units 1=C, 2=F are recognized; unknown units, malformed/omitted probes and ambiguous
@@ -121,5 +124,9 @@ PATH=/usr/bin:/bin:$PATH npm run check -- fireboard --run
 npm run build
 ```
 
-Cloud transport and payload tests use synthetic fixtures and mocks only. Preview
-uses the repository emulator/recorder; no real account/hardware/deployment tested.
+Cloud transport and payload tests use synthetic fixtures and mocks only. The
+single-file regression copies only app.py into a temporary directory, runs isolated
+Python subprocesses for help/default/demo (F and C) and file mode against a local
+HTTP display stub, and checks display cleanup. Cloud CLI mode is mocked; cache
+aging and HTTP-date Retry-After also have regression coverage. Preview uses the
+repository emulator/recorder; no real account/hardware/deployment tested.
