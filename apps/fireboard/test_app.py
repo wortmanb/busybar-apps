@@ -23,11 +23,11 @@ class Tests(unittest.TestCase):
         p = self.probes()[0]
         self.assertEqual(app.milestone(p)[0], 165)
         p.temp = 165
-        self.assertEqual(app.milestone(p), (203, 0))
+        self.assertEqual(app.milestone(p), (165, 1))
         p.temp = 184
         self.assertEqual(app.milestone(p), (203, .5))
         p.temp = 203
-        self.assertEqual(app.milestone(p), (None, 1))
+        self.assertEqual(app.milestone(p), (203, 1))
         p.targets = []
         self.assertEqual(app.milestone(p), (None, 0))
 
@@ -67,7 +67,7 @@ class Tests(unittest.TestCase):
                 self.assertTrue(0 <= e['x'] < 72 and 0 <= e['y'] < 16)
                 if e['type'] == 'text':
                     self.assertLessEqual(len(e['text']), 18)
-        self.assertIn('NEXT 165F', str(app.render(probes, 'F', 2)))
+        self.assertIn('M +7F', str(app.render(probes, 'F', 2)))
         probes[0].stale = True
         self.assertIn('STALE', str(app.render(probes, 'F', 2)))
 

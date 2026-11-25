@@ -10,7 +10,9 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+from cloud import CloudSource
 
 APP = "fireboard"
 WHITE, GREEN, AMBER, RED = "#FFFFFFFF", "#00DD88FF", "#FFAA00FF", "#FF4444FF"
@@ -37,6 +39,7 @@ class Probe:
     stale: bool
     targets: list
     baseline: float
+    limits: list = field(default_factory=list)
 
 
 def parse(data, config, now):
@@ -82,22 +85,43 @@ def parse(data, config, now):
         label = str(settings.get("label", key)).upper()
         if not label or not label.isascii() or not all(c.isalnum() or c == " " for c in label):
             raise ValueError("labels must contain ASCII letters, digits or spaces")
-        probes.append(Probe(label[:4], role, temp, stale, targets, baseline))
+        limits = [(direction, number(settings[name])) for direction, name in
+                  (("LO", "lower"), ("HI", "upper")) if settings.get(name) is not None]
+        if len(limits) == 2 and limits[0][1] >= limits[1][1]:
+            raise ValueError("lower must be less than upper")
+        probes.append(Probe(label[:4], role, temp, stale, targets, baseline, limits))
     if not probes:
         raise ValueError("configure at least one visible channel")
     return probes
 
 
 def milestone(probe):
-    """Next strictly higher heating target; progress within current milestone interval."""
+    """Next inclusive heating target; equality remains visibly HIT."""
     if probe.temp is None or probe.stale or not probe.targets:
         return None, 0
     previous = probe.baseline
     for target in probe.targets:
-        if target > probe.temp:
+        if target >= probe.temp:
             return target, max(0, min(1, (probe.temp - previous) / (target - previous)))
         previous = target
     return None, 1
+
+
+def proximity(probe, unit):
+    if probe.stale or probe.temp is None:
+        return "--", 0
+    if probe.limits:
+        gaps = [(probe.temp - t if direction == "LO" else t - probe.temp, direction, t)
+                for direction, t in probe.limits]
+        gap, direction, target = min(gaps)
+        progress = max(0, min(1, 1 - max(0, gap) / max(1, abs(target - probe.baseline))))
+        return (f"{direction} HIT" if gap <= 0 else
+                f"{direction} {'<1' if gap < 1 else display_number(gap)}{unit}"), progress
+    target, progress = milestone(probe)
+    if target is None:
+        return ("DONE" if probe.targets else "NO TARGET"), progress
+    gap = target - probe.temp
+    return ("M HIT" if gap == 0 else f"M +{'<1' if gap < 1 else display_number(gap)}{unit}"), progress
 
 
 def text(eid, value, x, y, color=WHITE):
@@ -121,11 +145,11 @@ def render(probes, unit, page):
                                  AMBER if probe.stale else RED if probe.temp is None else WHITE))
     else:
         probe = probes[page - overview_count]
-        target, progress = milestone(probe)
+        proximity_text, progress = proximity(probe, unit)
         value = "--" if probe.temp is None else f"{display_number(probe.temp)}{unit}"
         elements.append(text("0", f"{probe.label} {value}", 0, 0))
         status = "STALE" if probe.stale else "DISCONNECTED" if probe.temp is None else (
-            f"NEXT {display_number(target)}{unit}" if target is not None else "DONE" if probe.targets else "NO TARGET")
+            proximity_text)
         elements.append(text("1", status, 0, 7, AMBER if probe.stale else GREEN))
         elements.append(dict(id="2", type="rectangle", x=0, y=14, width=72, height=2,
                              border_width=0, fill="solid", fill_colors=["#223344FF"]))
@@ -192,7 +216,7 @@ def send(host, elements=None):
 DEMO_CONFIG = {"unit": "F", "channels": {
     "1": {"label": "BEEF", "targets": [165, 203]},
     "2": {"label": "PORK", "targets": [160, 195, 203]},
-    "3": {"label": "PIT", "role": "pit"},
+    "3": {"label": "PIT", "role": "pit", "lower": 225, "upper": 275},
     "4": {"label": "GRAT", "role": "grate"}}}
 
 
@@ -206,26 +230,34 @@ def main():
     parser.add_argument("--host", default="10.0.4.20")
     parser.add_argument("--source", help="normalized JSON file or bridge URL")
     parser.add_argument("--config", help="channel configuration JSON (required with --source)")
+    parser.add_argument("--cloud", action="store_true", help="direct FireBoard cloud (env FIREBOARD_TOKEN)")
     parser.add_argument("--demo", action="store_true", help="explicit demo (also default without source)")
     parser.add_argument("--test", action="store_true", help="draw one demo frame and exit")
     parser.add_argument("--interval", type=float, default=3, help="page duration, seconds (minimum 1)")
     args = parser.parse_args()
     if not math.isfinite(args.interval) or args.interval < 1:
         parser.error("interval must be finite and >= 1")
-    if args.source and (not args.config or args.demo):
-        parser.error("--source requires --config and cannot combine with --demo")
+    if sum(bool(x) for x in (args.source, args.cloud, args.demo)) > 1:
+        parser.error("choose only one of --source, --cloud, --demo")
+    if (args.source or args.cloud) and not args.config:
+        parser.error("--source/--cloud requires --config")
     config = load_source(args.config) if args.config else DEMO_CONFIG
+    cloud = CloudSource(config) if args.cloud else None
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     page = 0
     try:
         while True:
             try:
                 now = time.time()
-                probes = parse(load_source(args.source) if args.source else demo(now), config, now)
+                data = cloud.read() if cloud else load_source(args.source) if args.source else demo(now)
+                probes = parse(data, config, now)
                 elements = render(probes, config.get("unit", "F"), page)
+                if cloud and cloud.status != "OK":
+                    raise ValueError("cloud unavailable")
             except (OSError, ValueError, KeyError, TypeError):
                 # Never display cached readings as current after an ingestion error.
-                elements = [text("0", "SOURCE ERROR", 0, 0, RED), text("1", "CHECK INPUT", 0, 8, AMBER)]
+                elements = [text("0", cloud.status if cloud and cloud.status != "OK" else "SOURCE ERROR", 0, 0, RED),
+                            text("1", "CHECK INPUT", 0, 8, AMBER)]
                 for eid in ("2", "3"):
                     elements.append(dict(id=eid, type="rectangle", x=0, y=14,
                                          width=72, height=2, border_width=0,

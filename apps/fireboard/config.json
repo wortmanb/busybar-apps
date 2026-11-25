@@ -18,7 +18,9 @@
     },
     "3": {
       "label": "PIT",
-      "role": "pit"
+      "role": "pit",
+      "lower": 225,
+      "upper": 275
     },
     "4": {
       "label": "GRAT",
