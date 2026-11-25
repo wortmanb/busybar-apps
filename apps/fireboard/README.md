@@ -1,7 +1,7 @@
 # FireBoard temperature dashboard
 
 Stdlib-only Python 3.9+ host app for BusyBar's 72×16 display. Implemented:
-direct read-only FireBoard Cloud ingestion, normalized JSON bridge/file, and demo.
+direct read-only Home Assistant REST and FireBoard Cloud ingestion, normalized JSON bridge/file, and demo.
 No account, hardware or deployment is needed for tests or preview.
 `app.py` is self-contained: copying/downloading that file alone supports `--help`
 and the built-in demo without sibling modules, config files or pip dependencies.
@@ -67,6 +67,81 @@ Primary docs independently checked for this implementation:
 latest_temps freshness, rate limit) and
 [alerts](https://docs.fireboard.io/app/app-alerts/) (timing/buffer/repeat behavior).
 Cloud responses and hardware have **not** been tested against a real account.
+
+## Home Assistant setup (optional, no live connection required for development)
+
+Use your existing FireBoard integration's **temperature sensor** entities. In your
+own HA UI, open **Developer Tools → States** and inspect the desired probe's
+`entity_id`, state and `unit_of_measurement`. No bulk state discovery is performed
+by this app. Do not share account dumps or tokens. HA may itself still poll
+FireBoard Cloud: this route does not promise local-only device ingestion.
+
+From `apps/fireboard`, create a private `ha-config.json` using your actual IDs
+(the IDs below are placeholders, not automatically discovered):
+
+```json
+{"unit":"F","stale_after":120,"ha_poll_interval":30,"channels":{
+  "food":{"entity_id":"sensor.your_fireboard_probe_1","label":"BEEF","role":"food","upper":203},
+  "pit":{"entity_id":"sensor.your_fireboard_probe_2","label":"PIT","role":"pit","lower":225,"upper":275}
+}}
+```
+
+Provision a Home Assistant long-lived access token privately using your HA user
+profile's security/token UI. Load it locally through a secret manager or a hidden
+shell prompt, **never paste it into this repository, commands, config, or issues**.
+For example, in Bash (the prompt input is not echoed or stored in history):
+
+```bash
+cd apps/fireboard
+read -r -s -p 'HA token: ' FIREBOARD_HA_TOKEN; printf '\n'
+export FIREBOARD_HA_TOKEN
+export FIREBOARD_HA_URL='https://your-ha-host.example:8123'
+python3 app.py --ha --config ./ha-config.json --host 127.0.0.1:8080
+unset FIREBOARD_HA_TOKEN
+```
+
+The host above is an already-running local display emulator; choose your bar only
+when intended. `--ha` excludes `--cloud`, `--source` and `--demo`. Only `app.py`
+and your private configuration are required. URL defaults to
+`https://homeassistant.local:8123`; use a trusted TLS certificate. No automatic
+login, token refresh or HA writes. HA tokens can have broader account permissions
+than the GET-only behavior of this application; protect them accordingly.
+
+HTTPS is required remotely. For typical plain-HTTP HA on a **trusted LAN only**,
+explicitly set `FIREBOARD_HA_INSECURE_LOCAL=1` and e.g.
+`FIREBOARD_HA_URL=http://192.168.1.10:8123`. This emits a warning: the token is
+unencrypted and exposed to network observers. Only localhost, loopback or literal
+RFC1918 IPv4 addresses are accepted for that exception (not arbitrary DNS names).
+URLs cannot contain userinfo, paths beyond `/`, queries or fragments. Redirects
+are always rejected, never followed with credentials.
+
+One GET `/api/states/<mapped sensor.entity_id>` per unique mapping per poll;
+never GET all states. `ha_poll_interval` is 5–3600 seconds (default 30), independent
+of `--interval` page rotation. Each response is limited to 64 KiB and 5 seconds.
+Only `sensor.[a-z0-9_]+` IDs are accepted; response IDs must match exactly. A
+malformed/missing entity or failed request blanks that entity while valid entities
+remain visible. AUTH (401/403) clears everything and stops until restart. Other
+HTTP/transport/payload failures report PARTIAL and back off exponentially up to
+15 minutes; 429 stops the poll and waits at least 5 minutes (numeric Retry-After
+honored up to 1 hour). Status transitions go to stderr without raw errors/data.
+Backoff is shared, so partial errors slow successful entities too. Failed samples
+are not retained. Available entities still show age while cached. Polling is
+sequential; many mappings can take multiple request timeouts to finish a cycle.
+
+Native `°C`/`°F` are converted to display units, including legitimate zero.
+Unknown/unavailable/null/nonfinite/non-temperature states show red `--`. Manual
+thresholds remain the default; no HA alert entities are inferred or written.
+
+**Freshness is HA-report age, NOT proof of device sampling.** Prefer
+`last_reported` when present, otherwise `last_updated`. `last_changed` is ignored:
+an unchanged temperature may still be current. Conversely last_reported/updated
+may reflect integration reporting rather than a new FireBoard measurement.
+Missing/malformed timestamps remain stale, not replaced with fetch time. Values
+older than `stale_after` (default 120 seconds), or >30 seconds in the future, show
+amber `!` and no live progress. Choose a stale limit for your upstream cadence;
+older HA releases that do not update last_updated for identical readings may
+appear stale even when the device is healthy. This is intentionally conservative.
+No real HA/account access was used to implement or verify this mode.
 
 ## Bridge and file contract
 

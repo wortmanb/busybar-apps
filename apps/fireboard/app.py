@@ -5,6 +5,9 @@ import copy
 import datetime
 import email.utils
 import json
+import ipaddress
+import re
+import warnings
 import math
 import os
 import signal
@@ -335,6 +338,116 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         raise ValueError("redirects disabled to protect credentials")
 
 
+class HomeAssistantSource:
+    """Only mapped state GETs; timestamps describe HA reporting, not sampling."""
+
+    def __init__(self, config, clock=time.monotonic):
+        self.config, self.clock = config, clock
+        self.token = os.environ.get("FIREBOARD_HA_TOKEN", "")
+        if not self.token or not self.token.isascii() or any(ord(c) < 33 or ord(c) > 126 for c in self.token):
+            raise ValueError("FIREBOARD_HA_TOKEN must be a nonempty printable token")
+        base = os.environ.get("FIREBOARD_HA_URL", "https://homeassistant.local:8123")
+        try:
+            url = urllib.parse.urlsplit(base)
+            url.port  # Validate malformed ports without including the URL in errors.
+            if (url.scheme not in ("https", "http") or not url.hostname or url.username is not None
+                    or url.password is not None or "?" in base or "#" in base
+                    or url.path not in ("", "/") or any(c.isspace() for c in base)
+                    or "\\" in base):
+                raise ValueError()
+            if url.scheme == "http":
+                local = url.hostname == "localhost"
+                try:
+                    address = ipaddress.ip_address(url.hostname)
+                    local = address.is_loopback or address in ipaddress.ip_network("10.0.0.0/8") or address in ipaddress.ip_network("172.16.0.0/12") or address in ipaddress.ip_network("192.168.0.0/16")
+                except (ValueError, TypeError):
+                    pass
+                if not local or os.environ.get("FIREBOARD_HA_INSECURE_LOCAL") != "1":
+                    raise ValueError()
+                warnings.warn("Home Assistant token will travel over unencrypted local HTTP", RuntimeWarning)
+        except ValueError:
+            raise ValueError("HA URL requires HTTPS, no credentials/path/query/fragment; local HTTP needs explicit opt-in") from None
+        self.base = base.rstrip("/")
+        self.interval = number(config.get("ha_poll_interval", 30))
+        if self.interval < 5 or self.interval > 3600:
+            raise ValueError("ha_poll_interval must be 5 to 3600 seconds")
+        if not isinstance(config.get("channels"), dict) or not 1 <= len(config["channels"]) <= 99:
+            raise ValueError("configure 1 to 99 HA mappings")
+        for settings in config["channels"].values():
+            if (not isinstance(settings, dict) or not isinstance(settings.get("entity_id"), str)
+                    or not re.fullmatch(r"sensor\.[a-z0-9_]+", settings["entity_id"])):
+                raise ValueError("each HA channel requires a sensor entity_id")
+        self.opener = urllib.request.build_opener(NoRedirect)
+        self.next_poll, self.failures, self.stopped = 0, 0, False
+        self.status, self.cache = "STARTING", {"channels": []}
+
+    def read(self):
+        now = self.clock()
+        if self.stopped or now < self.next_poll:
+            return copy.deepcopy(self.cache)
+        readings, states, failed, rate_limited = {}, {}, False, False
+        retry_after = 300
+        self.next_poll = now + self.interval
+        for alias, settings in self.config["channels"].items():
+            entity = settings["entity_id"]
+            reading = {"id": alias, "temperature": None}
+            if entity not in states:
+                request = urllib.request.Request(self.base + "/api/states/" + entity, headers={
+                    "Authorization": "Bearer " + self.token, "Accept": "application/json"})
+                try:
+                    with self.opener.open(request, timeout=5) as response:
+                        body = response.read(65537)
+                    if len(body) > 65536:
+                        raise ValueError("oversize state")
+                    state = json.loads(body)
+                    if not isinstance(state, dict) or state.get("entity_id") != entity:
+                        raise ValueError("entity mismatch")
+                    states[entity] = state
+                except urllib.error.HTTPError as exc:
+                    if exc.fp is not None:
+                        exc.close()
+                    failed = True
+                    states[entity] = {}
+                    if exc.code in (401, 403):
+                        self.stopped, self.status, self.cache = True, "AUTH", {"channels": []}
+                        return copy.deepcopy(self.cache)
+                    if exc.code == 429:
+                        try:
+                            retry_after = min(3600, max(300, number(float(exc.headers.get("Retry-After", 300)))))
+                        except (ValueError, TypeError, AttributeError):
+                            pass
+                        rate_limited = True
+                        break
+                except (OSError, ValueError, TypeError):
+                    failed, states[entity] = True, {}
+            state = states[entity]
+            attrs = state.get("attributes")
+            attrs = attrs if isinstance(attrs, dict) else {}
+            native_unit = attrs.get("unit_of_measurement")
+            unit = "C" if native_unit == "°C" else "F" if native_unit == "°F" else None
+            try:
+                raw = state.get("state")
+                if not isinstance(raw, (str, int, float)) or isinstance(raw, bool):
+                    raise ValueError()
+                value = number(float(raw))
+                if unit and attrs.get("device_class", "temperature") == "temperature":
+                    reading.update(temperature=value, unit=unit)
+            except (ValueError, TypeError, OverflowError):
+                pass
+            # An invalid preferred timestamp remains unknown; never substitute fetch time.
+            reading["updated_at"] = timestamp(state.get("last_reported", state.get("last_updated")))
+            readings[alias] = reading
+        self.cache = {"channels": list(readings.values())}
+        if failed:
+            self.failures += 1
+            self.next_poll = now + max(retry_after if rate_limited else self.interval,
+                                       min(900, self.interval * 2 ** min(self.failures, 5)))
+            self.status = "RATE LIMIT" if rate_limited else "PARTIAL"
+        else:
+            self.failures, self.status = 0, "OK"
+        return copy.deepcopy(self.cache)
+
+
 def load_source(source):
     if source.startswith(("https://", "http://")):
         parsed = urllib.parse.urlsplit(source)
@@ -393,6 +506,7 @@ def main():
     parser.add_argument("--host", default="10.0.4.20")
     parser.add_argument("--source", help="normalized JSON file or bridge URL")
     parser.add_argument("--config", help="channel configuration JSON (required with --source)")
+    parser.add_argument("--ha", action="store_true", help="Home Assistant REST (env FIREBOARD_HA_TOKEN/URL)")
     parser.add_argument("--cloud", action="store_true", help="direct FireBoard cloud (env FIREBOARD_TOKEN)")
     parser.add_argument("--demo", action="store_true", help="explicit demo (also default without source)")
     parser.add_argument("--test", action="store_true", help="draw one demo frame and exit")
@@ -400,12 +514,13 @@ def main():
     args = parser.parse_args()
     if not math.isfinite(args.interval) or args.interval < 1:
         parser.error("interval must be finite and >= 1")
-    if sum(bool(x) for x in (args.source, args.cloud, args.demo)) > 1:
-        parser.error("choose only one of --source, --cloud, --demo")
-    if (args.source or args.cloud) and not args.config:
-        parser.error("--source/--cloud requires --config")
+    if sum(bool(x) for x in (args.source, args.cloud, args.demo, args.ha)) > 1:
+        parser.error("choose only one of --source, --cloud, --demo, --ha")
+    if (args.source or args.cloud or args.ha) and not args.config:
+        parser.error("--source/--cloud/--ha requires --config")
     config = load_source(args.config) if args.config else DEMO_CONFIG
-    cloud = CloudSource(config) if args.cloud else None
+    cloud = HomeAssistantSource(config) if args.ha else CloudSource(config) if args.cloud else None
+    last_status = None
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     page = 0
     started = time.monotonic()
@@ -416,7 +531,10 @@ def main():
                 data = cloud.read() if cloud else load_source(args.source) if args.source else demo(now)
                 probes = parse(data, config, now)
                 elements = render(probes, config.get("unit", "F"), page, time.monotonic() - started)
-                if cloud and cloud.status != "OK":
+                if cloud and cloud.status != last_status:
+                    print("Source status: " + cloud.status, file=sys.stderr)
+                    last_status = cloud.status
+                if cloud and cloud.status not in ("OK", "PARTIAL", "RATE LIMIT"):
                     raise ValueError("cloud unavailable")
             except (OSError, ValueError, KeyError, TypeError):
                 # Never display cached readings as current after an ingestion error.
