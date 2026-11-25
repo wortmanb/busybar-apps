@@ -54,7 +54,8 @@ class StandaloneTests(unittest.TestCase):
                 self.assertEqual(requests, [])
                 for args in [[], ['--demo']]:
                     run(*args, '--test', '--host', host)
-                    self.assertIn('BEEF 158F', str(requests[-2]))
+                    self.assertIn("'text': '158'", str(requests[-2]))
+                    self.assertIn("'text': '1F'", str(requests[-2]))
                     self.assertEqual(requests[-1][0], 'DELETE')
                 config = copy.deepcopy(app.DEMO_CONFIG)
                 config['unit'] = 'C'
@@ -67,11 +68,12 @@ class StandaloneTests(unittest.TestCase):
                     settings['targets'] = [app.convert(t, 'F', 'C') for t in settings.get('targets', [])]
                 config_path.write_text(json.dumps(config))
                 run('--demo', '--config', str(config_path), '--test', '--host', host)
-                self.assertIn('BEEF 70C', str(requests[-2]))
+                self.assertIn("'text': '70'", str(requests[-2]))
+                self.assertIn("'text': '1C'", str(requests[-2]))
                 data_path = Path(directory) / 'input.json'
                 data_path.write_text(json.dumps(app.demo(0)))
                 run('--source', str(data_path), '--config', str(config_path), '--test', '--host', host)
-                self.assertIn('OLD', str(requests[-2]))
+                self.assertIn("'text': '1!'", str(requests[-2]))
             finally:
                 server.shutdown()
                 worker.join()

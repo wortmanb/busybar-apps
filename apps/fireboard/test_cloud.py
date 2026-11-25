@@ -109,7 +109,7 @@ class CloudTests(unittest.TestCase):
     def test_proximity(self):
         p = app.Probe('PIT', 'pit', 250, False, [], 32, [('LO', 225), ('HI', 275)])
         self.assertEqual(app.proximity(p, 'F')[0], 'HI 25F')
-        for temp, expected in [(225, 'LO HIT'), (200, 'LO HIT'), (275, 'HI HIT'), (300, 'HI HIT'), (274.9, 'HI <1F')]:
+        for temp, expected in [(225, 'HI 50F'), (200, 'HI 75F'), (275, 'HI HIT'), (300, 'HI HIT'), (274.9, 'HI <1F')]:
             p.temp = temp
             self.assertEqual(app.proximity(p, 'F')[0], expected)
         p.stale = True

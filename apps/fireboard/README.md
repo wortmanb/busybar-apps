@@ -101,18 +101,39 @@ units, session applicability, schedule and buffer behavior cannot safely be prov
 from arbitrary historic alert metadata. Keep the official app as alerting authority.
 No alert writes, notifications, ETA prediction, BLE or direct device control.
 
-Overview pages show two temperatures and role F/P/G (or OLD/OFF). Detail pages
-show current temperature, gap in degrees and a proximity graph for that probe.
-`LO` = configured lower limit (reading minus limit); `HI` = configured upper limit
-(limit minus reading). Nearest boundary wins, breached boundary takes precedence;
-at or beyond either boundary **HIT** is inclusive. If limits exist, they take display
-precedence over heating milestones. `M +7F` means seven degrees to the next heating
-milestone; `M HIT` holds at exact equality instead of silently advancing. Above the
-last milestone shows DONE. Positive gaps under one degree show `<1`, not HIT.
-Bar progress approaches the boundary relative to baseline; it is not a time graph
-or notification countdown. No limits/milestones shows NO TARGET; stale/unavailable
-readings have no gap/progress. Pages rotate through overview pairs and every probe,
-including separately labeled pit/grate pages. Ambient values are not pinned.
+The default view is four 18-pixel tiles: original 7×7 flame (pit) anchored at
+x=0, a distinct grate icon at x=18 when configured, then steak icons for food.
+Each tile has a small **1-based visible config-order index plus F/C** beside the
+icon, numeric temperature beneath, and a 16×2 proximity bar. Index is not a cloud
+port: use config order to identify probes, including across food pages. Configuration accepts
+at most 99 visible channels for unambiguous two-digit indices. Missing pit leaves
+the left slot empty rather than relabeling food as pit. Numbers round to integer;
+-999 through 9999 fit, otherwise OVR. No long labels obscure the icons.
+
+Only food slots paginate (two per page with grate, three without), every
+`--interval` seconds, wrapping in config order. Pit never moves. Multiple grates
+or additional pit sources rotate independently through the distinct ambient slot;
+none are silently dropped. Their indices and icons identify each measured source.
+An otherwise unused far-right tile shows T and compact **HHMM** elapsed app-tracking
+time (e.g. 0105 = 1h05m). It uses monotonic time since process tracking began,
+resets on restart, and caps at `99h+` after 99:59. This is **not a cloud cook-session
+timer**. It is omitted on full pages to prioritize probe readability.
+
+Bars always mean **high-temperature proximity**, never nearest/low boundary.
+An explicit `upper` takes precedence; `lower` is retained configuration but is not
+visualized as a heating goal. Without upper, the next inclusive heating target is
+used: equality holds that milestone rather than silently advancing. Between targets
+the progress baseline is the previous target; for upper it is configured baseline.
+Progress is clamped 0–1. Green fill approaches the high goal; a full **red** bar
+marks equality/crossing (or completion above the final target). After crossing an
+intermediate milestone the next one becomes the goal. Endpoints only mean no high
+target; no notifications are sent or implied.
+
+Stale numeric values are amber with a dim icon and index+`!` badge; unavailable
+values are red `--`. Both replace the filled bar with a thin colored hairline,
+never stale progress. Source errors clear all tile elements and display the error
+instead. All 96 element IDs/types are reused across pages, blanks and errors to
+avoid retained-element ghosts and stay below firmware's 100-element limit.
 This is a visual monitor, not a safety alarm or claim that a notification fired.
 
 ## Verification

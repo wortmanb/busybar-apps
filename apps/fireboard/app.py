@@ -91,8 +91,8 @@ def parse(data, config, now):
         if len(limits) == 2 and limits[0][1] >= limits[1][1]:
             raise ValueError("lower must be less than upper")
         probes.append(Probe(label[:4], role, temp, stale, targets, baseline, limits))
-    if not probes:
-        raise ValueError("configure at least one visible channel")
+    if not probes or len(probes) > 99:
+        raise ValueError("configure 1 to 99 visible channels")
     return probes
 
 
@@ -111,10 +111,10 @@ def milestone(probe):
 def proximity(probe, unit):
     if probe.stale or probe.temp is None:
         return "--", 0
-    if probe.limits:
-        gaps = [(probe.temp - t if direction == "LO" else t - probe.temp, direction, t)
-                for direction, t in probe.limits]
-        gap, direction, target = min(gaps)
+    high = [t for direction, t in probe.limits if direction == "HI"]
+    if high:
+        target, direction = high[0], "HI"
+        gap = target - probe.temp
         progress = max(0, min(1, 1 - max(0, gap) / max(1, abs(target - probe.baseline))))
         return (f"{direction} HIT" if gap <= 0 else
                 f"{direction} {'<1' if gap < 1 else display_number(gap)}{unit}"), progress
@@ -133,38 +133,101 @@ def display_number(value):
     return f"{value:.0f}" if -999 <= value <= 9999 else "OVR"
 
 
-def render(probes, unit, page):
-    # Overview pairs followed by one detail page per probe. All text <=18 tiny glyphs.
-    overview_count = (len(probes) + 1) // 2
-    page %= overview_count + len(probes)
+BLACK, TRACK = "#000000FF", "#223344FF"
+# Original seven-pixel sprites, using the same crisp rectangle aesthetic as robots.
+SPRITES = {
+    "pit": ("...r...", "..rr...", ".rroo..", ".rooor.", "rroyorr", "rroyorr", ".rrrrr."),
+    "food": ("..ppp..", ".prrrp.", "prwwrrp", "prwwrrp", "prrrrrp", ".prrrp.", "..ppp.."),
+    "grate": (".......", "sssssss", ".s.s.s.", "sssssss", ".s.s.s.", "sssssss", "......."),
+}
+PALETTE = {".": BLACK, "r": "#EF553FFF", "o": "#FF9900FF",
+           "y": "#FFDD55FF", "p": "#FFAA99FF", "w": WHITE, "s": "#88AABBFF"}
+
+
+def rectangle(eid, x, y, width, height, color):
+    return dict(id=eid, type="rectangle", x=x, y=y, width=width, height=height,
+                border_width=0, fill="solid", fill_colors=[color])
+
+
+def elapsed_label(elapsed):
+    minutes = max(0, int(elapsed)) // 60
+    return f"{minutes // 60:02}:{minutes % 60:02}" if minutes < 6000 else "99h+"
+
+
+def tile_sources(probes, page):
+    pits = [p for p in probes if p.role == "pit"]
+    ambient = [p for p in probes if p.role == "grate"] + pits[1:]
+    foods = [p for p in probes if p.role == "food"]
+    capacity = 2 if ambient else 3
+    pages = max(1, (len(foods) + capacity - 1) // capacity)
+    start = (page % pages) * capacity
+    # Extra ambient sources rotate independently; the primary pit never moves.
+    return ([pits[0] if pits else None] +
+            ([ambient[page % len(ambient)]] if ambient else []) +
+            foods[start:start + capacity])
+
+
+def render(probes, unit, page, elapsed=0, error=None):
+    """Four 18px tiles, fixed IDs/types (including blanks) for retained firmware."""
+    sources = tile_sources(probes, page)
     elements = []
-    if page < overview_count:
-        for i, probe in enumerate(probes[page * 2:page * 2 + 2]):
-            value = "--" if probe.temp is None else f"{display_number(probe.temp)}{unit}"
-            flag = "OLD" if probe.stale else "OFF" if probe.temp is None else probe.role[:1].upper()
-            elements.append(text(str(i), f"{probe.label} {value} {flag}", 0, i * 8,
-                                 AMBER if probe.stale else RED if probe.temp is None else WHITE))
-    else:
-        probe = probes[page - overview_count]
-        proximity_text, progress = proximity(probe, unit)
-        value = "--" if probe.temp is None else f"{display_number(probe.temp)}{unit}"
-        elements.append(text("0", f"{probe.label} {value}", 0, 0))
-        status = "STALE" if probe.stale else "DISCONNECTED" if probe.temp is None else (
-            proximity_text)
-        elements.append(text("1", status, 0, 7, AMBER if probe.stale else GREEN))
-        elements.append(dict(id="2", type="rectangle", x=0, y=14, width=72, height=2,
-                             border_width=0, fill="solid", fill_colors=["#223344FF"]))
-        elements.append(dict(id="3", type="rectangle", x=0, y=14, width=max(1, round(72 * progress)),
-                             height=2, border_width=0, fill="solid",
-                             fill_colors=[GREEN if progress else "#223344FF"]))
-    if page < overview_count:
-        if len(elements) == 1:
-            elements.append(text("1", "", 0, 8))
-        # Firmware retains element IDs between draws: erase previous detail bars.
-        for eid in ("2", "3"):
-            elements.append(dict(id=eid, type="rectangle", x=0, y=14,
-                                 width=72, height=2, border_width=0,
-                                 fill="solid", fill_colors=["#000000FF"]))
+    for slot in range(4):
+        x, prefix = slot * 18, f"t{slot}"
+        probe = sources[slot] if slot < len(sources) else None
+        sprite = SPRITES[probe.role] if probe and not error else (".......",) * 7
+        unavailable = probe is not None and probe.temp is None
+        stale = probe is not None and probe.stale and not unavailable
+        color = RED if unavailable or error else AMBER if stale else WHITE
+        elements.append(rectangle(prefix + "bg", x, 0, 18, 16, BLACK))
+        runs = []
+        for y, row in enumerate(sprite):
+            dx = 0
+            while dx < 7:
+                end = dx + 1
+                while end < 7 and row[end] == row[dx]:
+                    end += 1
+                if row[dx] != ".":
+                    ink = "#775522FF" if stale else PALETTE[row[dx]]
+                    previous = next((i for i, r in enumerate(runs)
+                                     if r[0] == x + dx and r[2] == end - dx
+                                     and r[4] == ink and r[1] + r[3] == y), None)
+                    if previous is not None:
+                        rx, ry, rw, rh, _ = runs[previous]
+                        runs[previous] = (rx, ry, rw, rh + 1, ink)
+                    else:
+                        runs.append((x + dx, y, end - dx, 1, ink))
+                dx = end
+        assert len(runs) <= 19, "sprite exceeds element budget"
+        for i in range(19):
+            rx, ry, width, height, ink = runs[i] if i < len(runs) else (x, 0, 1, 1, "#00000000")
+            elements.append(rectangle(f"{prefix}p{i}", rx, ry, width, height, ink))
+        index = str(next((i + 1 for i, p in enumerate(probes) if p is probe), 0))
+        badge = (index if len(index) <= 2 else "+") + unit if probe else ""
+        value = "--" if unavailable else display_number(probe.temp) if probe else ""
+        if error:
+            badge, value = "", (error[:18] if slot == 3 else "")
+        elif stale:
+            badge = index + "!"
+        elif probe is None and slot == 3:
+            badge, value = "T", elapsed_label(elapsed)
+        elements.append(text(prefix + "id", badge, x + 7, 0, color))
+        # A 5-glyph timer uses the entire final tile only with a compact font.
+        if len(value) > 4 and not error:
+            value = value.replace(":", "")  # HHMM; T badge identifies elapsed hours/minutes
+        elements.append(text(prefix + "v", value, 0 if error else x, 8, color))
+        status, progress = proximity(probe, unit) if probe and not error else ("", 0)
+        bar_color = RED if "HIT" in status or status == "DONE" else GREEN
+        track = TRACK if probe and not error else BLACK
+        width, ink = round(16 * progress), bar_color
+        height = 2
+        if unavailable or stale:
+            width, ink, height = 16, color, 1  # hairline, never a live filled bar
+        elif status == "NO TARGET":
+            width, ink = 1, TRACK
+            track = BLACK
+        elements.append(rectangle(prefix + "b0", x, 14, 16, 2, track))
+        elements.append(rectangle(prefix + "b1", x, 14, max(1, width), height,
+                                  ink if width else track))
     return elements
 
 
@@ -344,23 +407,20 @@ def main():
     cloud = CloudSource(config) if args.cloud else None
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     page = 0
+    started = time.monotonic()
     try:
         while True:
             try:
                 now = time.time()
                 data = cloud.read() if cloud else load_source(args.source) if args.source else demo(now)
                 probes = parse(data, config, now)
-                elements = render(probes, config.get("unit", "F"), page)
+                elements = render(probes, config.get("unit", "F"), page, time.monotonic() - started)
                 if cloud and cloud.status != "OK":
                     raise ValueError("cloud unavailable")
             except (OSError, ValueError, KeyError, TypeError):
                 # Never display cached readings as current after an ingestion error.
-                elements = [text("0", cloud.status if cloud and cloud.status != "OK" else "SOURCE ERROR", 0, 0, RED),
-                            text("1", "CHECK INPUT", 0, 8, AMBER)]
-                for eid in ("2", "3"):
-                    elements.append(dict(id=eid, type="rectangle", x=0, y=14,
-                                         width=72, height=2, border_width=0,
-                                         fill="solid", fill_colors=["#000000FF"]))
+                elements = render([], config.get("unit", "F"), page,
+                                  error=cloud.status if cloud and cloud.status != "OK" else "SOURCE ERROR")
             try:
                 send(args.host, elements)
             except (OSError, ValueError):
