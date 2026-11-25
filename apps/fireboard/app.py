@@ -14,6 +14,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
+from typing import Optional
 
 APP = "fireboard"
 WHITE, GREEN, AMBER, RED = "#FFFFFFFF", "#00DD88FF", "#FFAA00FF", "#FF4444FF"
@@ -36,7 +37,7 @@ def convert(value, source, target):
 class Probe:
     label: str
     role: str
-    temp: float | None
+    temp: Optional[float]
     stale: bool
     targets: list
     baseline: float

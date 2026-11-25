@@ -1,6 +1,6 @@
 # FireBoard temperature dashboard
 
-Stdlib-only Python 3.10+ host app for BusyBar's 72×16 display. Implemented:
+Stdlib-only Python 3.9+ host app for BusyBar's 72×16 display. Implemented:
 direct read-only FireBoard Cloud ingestion, normalized JSON bridge/file, and demo.
 No account, hardware or deployment is needed for tests or preview.
 `app.py` is self-contained: copying/downloading that file alone supports `--help`
@@ -144,6 +144,10 @@ PATH=/usr/bin:/bin:$PATH npm run preview -- fireboard --png -- --demo
 PATH=/usr/bin:/bin:$PATH npm run check -- fireboard --run
 npm run build
 ```
+
+For compatibility, the same suite can be run with Python 3.9; isolated subprocesses
+use the interpreter running the tests. Python 3.9 is the minimum supported version
+(including macOS system Python 3.9); newer supported Python releases are recommended.
 
 Cloud transport and payload tests use synthetic fixtures and mocks only. The
 single-file regression copies only app.py into a temporary directory, runs isolated

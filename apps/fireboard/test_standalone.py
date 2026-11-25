@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -43,7 +44,7 @@ class StandaloneTests(unittest.TestCase):
             env = {k: v for k, v in os.environ.items() if not k.startswith(('PYTHON', 'FIREBOARD'))}
 
             def run(*args):
-                result = subprocess.run(['/usr/bin/python3', '-I', str(target), *args],
+                result = subprocess.run([sys.executable, '-I', str(target), *args],
                                         cwd=directory, env=env, capture_output=True, text=True, timeout=10)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 return result
