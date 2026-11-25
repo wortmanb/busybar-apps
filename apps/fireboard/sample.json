@@ -1,0 +1,22 @@
+{
+  "unit": "F",
+  "updated_at": 1700000000,
+  "channels": [
+    {
+      "id": "1",
+      "temperature": 158
+    },
+    {
+      "id": "2",
+      "temperature": 172
+    },
+    {
+      "id": "3",
+      "temperature": 250
+    },
+    {
+      "id": "4",
+      "temperature": 238
+    }
+  ]
+}

@@ -1,0 +1,30 @@
+{
+  "unit": "F",
+  "channels": {
+    "1": {
+      "label": "BEEF",
+      "targets": [
+        165,
+        203
+      ]
+    },
+    "2": {
+      "label": "PORK",
+      "targets": [
+        160,
+        195,
+        203
+      ]
+    },
+    "3": {
+      "label": "PIT",
+      "role": "pit",
+      "lower": 225,
+      "upper": 275
+    },
+    "4": {
+      "label": "GRAT",
+      "role": "grate"
+    }
+  }
+}

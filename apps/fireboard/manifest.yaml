@@ -1,0 +1,7 @@
+name: FireBoard
+author: wortmanb
+description: Probe temperatures and next configured cooking milestone, with pit and grate overview and stale-data warnings.
+tags:
+  - monitor
+  - info
+preview: ./preview.png
